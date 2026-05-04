@@ -70,9 +70,9 @@ class ZeroOrderOptimizer:
         self.lr = lr
         self.eps = eps
 
-        if perturbation_mode not in ("gaussian", "uniform"):
+        if perturbation_mode not in ("gaussian", "uniform", "rademacher"):
             raise ValueError(
-                f"perturbation_mode must be 'gaussian' or 'uniform', "
+                f"perturbation_mode must be 'gaussian', 'uniform' or 'rademacher'; "
                 f"got '{perturbation_mode}'"
             )
         self.perturbation_mode = perturbation_mode
@@ -88,6 +88,11 @@ class ZeroOrderOptimizer:
         # a dynamic schedule (e.g. gradually unfreeze deeper layers).
         # ------------------------------------------------------------------
         self.layer_names: list[str] = ["fc.weight", "fc.bias"]
+        self.step_count = 0
+
+        # Buffers for optimizer
+        self.m: dict[str, torch.Tensor] = {}
+        self.v: dict[str, torch.Tensor] = {}
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -126,14 +131,17 @@ class ZeroOrderOptimizer:
         Returns:
             A tensor of the same shape as ``param``, normalised to unit L2 norm.
         """
-        if self.perturbation_mode == "gaussian":
-            u = torch.randn_like(param)
-        else:  # uniform
-            u = torch.rand_like(param) * 2.0 - 1.0
+        if self.perturbation_mode == "rademacher":
+            u = (torch.randint_like(param, 0, 2).float() * 2.0 - 1.0)
+        else:
+            if self.perturbation_mode == "gaussian":
+                u = torch.randn_like(param)
+            else:  # uniform
+                u = torch.rand_like(param) * 2.0 - 1.0
+            norm = u.norm()
+            if norm > 0:
+                u = u / norm
 
-        norm = u.norm()
-        if norm > 0:
-            u = u / norm
         return u
 
     def _estimate_grad(
@@ -174,21 +182,25 @@ class ZeroOrderOptimizer:
         grads: dict[str, torch.Tensor] = {}
 
         with torch.no_grad():
+
+            # 1. generate one simultaneous perturbation for all params
+            us = {name: self._sample_direction(param) for name, param in params.items()}
+
+            # f(x + eps * u)
             for name, param in params.items():
-                u = self._sample_direction(param)
+                param.data.add_(self.eps * us[name])
+            f_plus = loss_fn()
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
-                f_plus = loss_fn()
+            # f(x - eps * u)  — restore then subtract
+            for name, param in params.items():
+                param.data.sub_(2.0 * self.eps * us[name])
+            f_minus = loss_fn()
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
-                f_minus = loss_fn()
+            # Restore original value
+            for name, param in params.items():
+                param.data.add_(self.eps * us[name])
 
-                # Restore original value
-                param.data.add_(self.eps * u)
-
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
+                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * us[name]
                 grads[name] = grad_estimate
 
         return grads
@@ -218,9 +230,27 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the parameter update below.
         # ------------------------------------------------------------------
+        beta1, beta2 = 0.9, 0.999
+        
         with torch.no_grad():
             for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
+                # Initialize momentum buffers dynamically (useful for curriculum learning)
+                if name not in self.m:
+                    self.m[name] = torch.zeros_like(param)
+                    self.v[name] = torch.zeros_like(param)
+                    
+                g = grads[name]
+                
+                # Update biased first and second moment estimates
+                self.m[name] = beta1 * self.m[name] + (1 - beta1) * g
+                self.v[name] = beta2 * self.v[name] + (1 - beta2) * (g ** 2)
+                
+                # Compute bias-corrected moment estimates
+                m_hat = self.m[name] / (1 - beta1 ** self.step_count)
+                v_hat = self.v[name] / (1 - beta2 ** self.step_count)
+                
+                # Apply Adam update
+                param.data.sub_(self.lr * m_hat / (torch.sqrt(v_hat) + 1e-8))
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -250,6 +280,15 @@ class ZeroOrderOptimizer:
             Each forward pass inside ``loss_fn`` counts toward your compute
             budget, so prefer estimators that minimise the number of calls.
         """
+        self.step_count +=1
+
+        # if self.step_count == 64:
+        #     self.layer_names.extend([
+        #         "layer4.1.conv2.weight", 
+        #         "layer4.1.bn2.weight", 
+        #         "layer4.1.bn2.bias"
+        #     ])
+        
         params = self._active_params()
 
         # Record the loss before any perturbation.
