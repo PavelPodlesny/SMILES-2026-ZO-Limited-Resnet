@@ -27,6 +27,9 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
+import json
+import os
+
 
 class ZeroOrderOptimizer:
     """Gradient-free optimizer for fine-tuning a subset of model parameters.
@@ -61,38 +64,38 @@ class ZeroOrderOptimizer:
 
     def __init__(
         self,
-        model: nn.Module,
-        lr: float = 1e-3,
-        eps: float = 1e-3,
-        perturbation_mode: str = "gaussian",
+        model: nn.Module
     ) -> None:
         self.model = model
-        self.lr = lr
-        self.eps = eps
 
-        if perturbation_mode not in ("gaussian", "uniform", "rademacher"):
+        self.alpha = 0.602
+        self.gamma = 0.101
+        self.c = 0.2
+        self.n_steps = 128
+        self.perturbation_mode = "rademacher"
+
+        config_path = "optimizer_config.json"
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+                self.alpha = config.get("alpha", self.alpha)
+                self.gamma = config.get("gamma", self.gamma)
+                self.c = config.get("c", self.c)
+                self.n_steps = config.get("n_steps", self.n_steps)
+                self.perturbation_mode = config.get("perturbation_mode", self.perturbation_mode)
+                
+        if self.perturbation_mode not in ("gaussian", "uniform", "rademacher"):
             raise ValueError(
                 f"perturbation_mode must be 'gaussian', 'uniform' or 'rademacher'; "
-                f"got '{perturbation_mode}'"
-            )
-        self.perturbation_mode = perturbation_mode
-
-        # ------------------------------------------------------------------
-        # STUDENT: Set self.layer_names to the parameters you want to tune.
-        #
-        # The default below selects only the final classification head.
-        # You may replace this with any subset of named parameters, e.g.:
-        #   self.layer_names = ["layer4.1.conv2.weight", "fc.weight", "fc.bias"]
-        #
-        # You can also update self.layer_names inside .step() to implement
-        # a dynamic schedule (e.g. gradually unfreeze deeper layers).
-        # ------------------------------------------------------------------
+                f"got '{self.perturbation_mode}'"
+            )  
+            
+        self.A = self.n_steps * 0.1
+        self.a = 0.05 * (self.A + 1) ** self.alpha
+        self.k = 1
+        
         self.layer_names: list[str] = ["fc.weight", "fc.bias"]
-        self.step_count = 0
 
-        # Buffers for optimizer
-        self.m: dict[str, torch.Tensor] = {}
-        self.v: dict[str, torch.Tensor] = {}
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -181,27 +184,28 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         grads: dict[str, torch.Tensor] = {}
 
+        ck = self.c / (self.k ** self.gamma)
+        
         with torch.no_grad():
 
-            # 1. generate one simultaneous perturbation for all params
-            us = {name: self._sample_direction(param) for name, param in params.items()}
+            # generate perturbation for all params
+            delta = {name: self._sample_direction(param) for name, param in params.items()}
 
-            # f(x + eps * u)
+            # f(w + c_k * u)
             for name, param in params.items():
-                param.data.add_(self.eps * us[name])
+                param.data.add_(ck * delta[name])
             f_plus = loss_fn()
 
-            # f(x - eps * u)  — restore then subtract
+            # f(w - c_k * u)  — restore then subtract
             for name, param in params.items():
-                param.data.sub_(2.0 * self.eps * us[name])
+                param.data.sub_(2.0 * ck * delta[name])
             f_minus = loss_fn()
 
-            # Restore original value
+            # restore original value
             for name, param in params.items():
-                param.data.add_(self.eps * us[name])
+                param.data.add_(ck * delta[name])
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * us[name]
-                grads[name] = grad_estimate
+                grads[name] = (f_plus - f_minus) / (2.0 * ck) * delta[name]
 
         return grads
         # ------------------------------------------------------------------
@@ -230,27 +234,12 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the parameter update below.
         # ------------------------------------------------------------------
-        beta1, beta2 = 0.9, 0.999
+        ak = self.a / (self.A + self.k)**self.alpha
         
         with torch.no_grad():
             for name, param in params.items():
-                # Initialize momentum buffers dynamically (useful for curriculum learning)
-                if name not in self.m:
-                    self.m[name] = torch.zeros_like(param)
-                    self.v[name] = torch.zeros_like(param)
-                    
-                g = grads[name]
+                param.data.sub_(ak * grads[name])
                 
-                # Update biased first and second moment estimates
-                self.m[name] = beta1 * self.m[name] + (1 - beta1) * g
-                self.v[name] = beta2 * self.v[name] + (1 - beta2) * (g ** 2)
-                
-                # Compute bias-corrected moment estimates
-                m_hat = self.m[name] / (1 - beta1 ** self.step_count)
-                v_hat = self.v[name] / (1 - beta2 ** self.step_count)
-                
-                # Apply Adam update
-                param.data.sub_(self.lr * m_hat / (torch.sqrt(v_hat) + 1e-8))
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -280,7 +269,6 @@ class ZeroOrderOptimizer:
             Each forward pass inside ``loss_fn`` counts toward your compute
             budget, so prefer estimators that minimise the number of calls.
         """
-        self.step_count +=1
 
         # if self.step_count == 64:
         #     self.layer_names.extend([
@@ -297,5 +285,7 @@ class ZeroOrderOptimizer:
 
         grads = self._estimate_grad(loss_fn, params)
         self._update_params(params, grads)
+
+        self.k += 1
 
         return float(loss_before)
