@@ -71,7 +71,7 @@ class ZeroOrderOptimizer:
         self.alpha = 0.602
         self.gamma = 0.101
         self.c = 0.2
-        self.n_steps = 128
+        self.A = 0
         self.perturbation_mode = "rademacher"
 
         config_path = "optimizer_config.json"
@@ -81,7 +81,7 @@ class ZeroOrderOptimizer:
                 self.alpha = config.get("alpha", self.alpha)
                 self.gamma = config.get("gamma", self.gamma)
                 self.c = config.get("c", self.c)
-                self.n_steps = config.get("n_steps", self.n_steps)
+                self.A = config.get("A", self.A)
                 self.perturbation_mode = config.get("perturbation_mode", self.perturbation_mode)
                 
         if self.perturbation_mode not in ("gaussian", "uniform", "rademacher"):
@@ -90,7 +90,6 @@ class ZeroOrderOptimizer:
                 f"got '{self.perturbation_mode}'"
             )  
             
-        self.A = self.n_steps * 0.1
         self.a = 0.05 * (self.A + 1) ** self.alpha
         self.k = 1
         
